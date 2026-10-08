@@ -1,0 +1,246 @@
+---
+title: "Final code"
+author: "Jihyun Lee"
+date: "2026-10-04"
+output: html_document
+---
+
+# Libraries
+```{r}
+library(dplyr)
+library(tidyr)
+library(clubSandwich)
+library(metafor)
+library(metaSEM)
+```
+
+
+# Cleaned data
+```{r}
+#data_new <- read.csv("data_new_261008b.csv")[,-1]
+load("FinalResult_261008.RData")
+
+
+```
+
+## Descriptives
+
+```{r}
+data_new %>%
+  group_by(Study) %>%
+  summarise(m_age = mean(Age, na.rm = T),
+            med_age = median(Age, na.rm = T),
+            m_N = mean(N, na.rm = T),
+            med_N = median(N, na.rm = T))
+
+
+table(data_new$Language, useNA = "always")
+
+table(data_new$Country_recode, useNA = "always")
+
+
+table(data_new$School_new, useNA = "always")
+table(data_new$Outcome_New, useNA = "always")
+
+
+# ---- Language
+data_new %>% 
+  group_by(Study_new) %>% 
+  summarise(n_lang = n_distinct(Language)) %>% 
+  filter(n_lang > 1)
+
+data_new %>% 
+  distinct(Study_new, Language) %>%
+  count(Language)
+            # 173 
+
+# ------- Country
+data_new %>% 
+  group_by(Study_new) %>% 
+  summarise(n_count = n_distinct(Country_recode)) %>% 
+  filter(n_count > 1)
+
+data_new %>% 
+  distinct(Study_new, Country_recode) %>%
+  count(Country_recode)
+
+
+# --- School
+data_new %>% 
+  group_by(Study_new) %>% 
+  summarise(n_count = n_distinct(School_new)) %>% 
+  filter(n_count > 1)
+
+data_new %>% 
+  distinct(Study_new, School_new) %>%
+  count(School_new)
+
+
+
+# --- outcome 
+data_new %>% 
+  group_by(Study_new) %>% 
+  summarise(n_count = n_distinct(Outcome_New)) %>% 
+  filter(n_count > 1)
+
+data_new %>% 
+  distinct(Study_new, Outcome_New) %>%
+  count(Outcome_New)
+
+data_new %>% 
+  count(Study_new, Outcome_New) # 216 rows (Sample-level )
+```
+
+
+## data_long
+
+```{r}
+data_long <- data_new %>%
+  pivot_longer(cols = starts_with("r."),
+               names_to = "pair",
+               values_to = "r", values_drop_na = TRUE)
+
+summary(data_long$r)
+
+data_long <- data_long %>% mutate(vr = ((1-r^2)^2)/(N-1))
+
+# --- add ESID
+data_long <- data_long %>%
+  ungroup() %>%
+  mutate(ESID = row_number()) 
+
+pair_n <- data_long %>% group_by(pair) %>%
+  summarise(n = n())
+
+# write.csv(pair_n, "pair_n.csv")
+
+
+# total N
+sampleN_cfa <- data_long %>% group_by(Study_new) %>%
+  summarise(avgN = mean(unique(N))) %>%
+  ungroup()
+
+n_cfa <- sum(sampleN_cfa$avgN)
+
+## ------- number of samples for each correlation
+```
+
+
+# Stage one: Pooling 
+
+- "Study" (unique sample) as a cluster
+
+## Functions to pool: 
+```{r}
+fn_pooled_r_ach <- function(model, cluster){
+
+corlable <- c("ach", "anx", "att", "con", "inp", "mot", "smi", "sft", "sta","tst",  "tmt") # order checked!
+
+coef_pool <- coef_test(model, vcov = "CR2", cluster = cluster)
+coef_r <- coef_pool$beta
+
+coef_r <- c(coef_r[1:45], coef_r[49], coef_r[46], coef_r[47], coef_r[48], coef_r[50:55])
+
+# Matrix format
+r_mat <- vec2symMat(coef_r, diag=FALSE, byrow = FALSE) # This is the correct order
+
+# --- change the order as coefficient label
+Rcorr <- matrix(r_mat, ncol=11, nrow=11,
+                    dimnames=list(corlable, corlable))
+return(Rcorr)
+}
+
+fn_pooled_acov_ach <- function(model, cluster){
+# ----------------- Cluster-Robust Variance-Covariance Matrix
+vcov <- vcovCR(model, 
+                    type = "CR2", 
+                    cluster = cluster) # using clubSandwich package
+
+
+# ---------- Change the order
+vcov_dat <- rbind(vcov[1:45,], vcov[49,], vcov[46:48,], vcov[50:55,])
+
+vcov_dat <- cbind(vcov_dat[,1:45], vcov_dat[,49], vcov_dat[,46:48], vcov_dat[,50:55])
+
+return(vcov_dat)
+}
+
+```
+
+
+```{r}
+# --- construct Var-cov matrix
+Vmat_std <- impute_covariance_matrix(data_long$vr,
+                                  cluster = data_long$Study,
+                                  r = .8,
+                                  smooth_vi = TRUE)
+
+# --- Pooling correlations in meta-regression framework
+pool_std <- rma.mv(r ~ -1 + pair,
+                        V = Vmat_std, 
+                        random = ~ 1 | Study / ESID,
+                        data = data_long, sparse = TRUE)
+
+summary(pool_std)
+
+# ---- Create a matrix format
+Rcorr_std <- fn_pooled_r_ach(pool_std)
+is.pd(Rcorr_std) # checking NPD: should be TRUE
+
+# ---- Create a Vcov matrix format
+vcov_std <- fn_pooled_acov_ach(model = pool_std, cluster = data_long$Study)
+is.pd(vcov_std) # TRUE
+
+```
+
+
+
+
+# Stage two
+
+## Model syntax 
+
+Create a model syntax
+
+```{r}
+mdl_sem_nocor <- 
+"
+# Measurement model
+affect =~ tmt + mot + con + att
+anxiety =~ anx + tst + smi
+cognitive =~ inp + sft + sta
+
+
+## Direct effect
+ach ~ c*affect + b*anxiety + e*cognitive
+
+## Mediator effect
+anxiety ~ a*affect
+cognitive ~ d*affect
+
+# fix variance of the independent variable
+affect ~~ 1*affect
+
+## Indirect effect
+ind_anx := a*b
+ind_cog := d*e
+
+## total effect
+anx_ach := c + (a*b) 
+cog_ach := c + (d*e)
+"
+
+
+RAM_mdl_sem_nocor <- lavaan2RAM(mdl_sem_nocor, obs.variables = c("ach", "anx", "att", "con", "inp", "mot","sft", "smi",  "sta", "tmt", "tst"))
+
+```
+
+
+## Fitting a model
+
+```{r}
+sem_nocor_std <- wls(Cov=Rcorr_std, aCov=vcov_std, n=n_cfa, RAM = RAM_mdl_sem_nocor, diag.constraints = T,  intervals.type = "LB")
+
+summary(sem_nocor_std, fit.measures = TRUE, rsquare = TRUE, modindices = TRUE)
+```
+
